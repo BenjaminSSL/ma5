@@ -21,6 +21,7 @@ const (
 	heartbeatTimeout  = 10 * time.Second
 	electionTimeout   = 5 * time.Second
 	requestTimeout    = 2 * time.Second
+	auctionTime       = 67 * time.Second
 )
 
 type Bid struct {
@@ -39,6 +40,7 @@ type Server struct {
 	electionInProgress bool
 	electionStarted    time.Time
 	lastHeartbeat      time.Time
+	auctionEndTime     time.Time
 
 	bidMu sync.Mutex
 	bids  map[int]int
@@ -61,12 +63,13 @@ func main() {
 	delete(nodes, *id)
 
 	s := &Server{
-		otherNodes:    nodes,
-		id:            *id,
-		leader:        *id == 0,
-		leaderID:      0,
-		bids:          make(map[int]int),
-		lastHeartbeat: time.Now(),
+		otherNodes:     nodes,
+		id:             *id,
+		leader:         *id == 0,
+		leaderID:       0,
+		bids:           make(map[int]int),
+		lastHeartbeat:  time.Now(),
+		auctionEndTime: time.Now().Add(auctionTime),
 	}
 	s.initServer()
 
@@ -316,7 +319,13 @@ func (s *Server) bid(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	isLeader := s.leader
 	leaderID := s.leaderID
+	auctionEndTime := s.auctionEndTime
 	s.mu.Unlock()
+
+	if time.Now().After(auctionEndTime) || time.Now().Equal(auctionEndTime) {
+		http.Redirect(w, r, fmt.Sprintf("http://localhost:%d/result", 8000+leaderID), http.StatusSeeOther)
+		return
+	}
 
 	// Only the leader accepts external bids.
 	if !isLeader {

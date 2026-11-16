@@ -1,24 +1,35 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 )
 
 func main() {
 
-	var servers = []string{"http://localhost:8000", "http://localhost:8001"}
+	var servers = []string{"http://localhost:8000", "http://localhost:8001", "http://localhost:8002"}
 
 	clientID := flag.Int("id", 0, "Client ID")
 	flag.Parse()
 
+	scanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Printf("Client %d: Enter bid amount: ", *clientID)
-		var amount int
-		_, err := fmt.Scanf("%d", &amount)
-		if err != nil {
-			fmt.Println("Invalid input. Please enter a valid integer.")
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				fmt.Printf("Failed to read input: %v\n", err)
+			}
+			return
+		}
+
+		amount, err := strconv.Atoi(scanner.Text())
+		if err != nil || amount <= 0 {
+			fmt.Println("Invalid input. Please enter a positive integer.")
 			continue
 		}
 
@@ -45,6 +56,14 @@ func bidAmount(clientID int, amount int, servers []string) {
 		}
 		defer resp.Body.Close()
 
+		if resp.StatusCode == http.StatusOK && resp.Request.URL.Path == "/result" {
+			var result map[string]any
+			json.NewDecoder(resp.Body).Decode(&result)
+			for key, value := range result {
+				fmt.Printf("%-15s : %v\n", key, value)
+			}
+			return
+		}
 		if resp.StatusCode == http.StatusOK {
 			fmt.Printf("Client %d: Successfully placed bid of %d to %s\n", clientID, amount, server)
 			return
