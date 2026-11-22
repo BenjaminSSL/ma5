@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -15,7 +16,7 @@ func main() {
 
 	clientID := flag.Int("id", 0, "Client ID")
 	flag.Parse()
-	fmt.Printf("To exit the client write exit\n")
+	fmt.Printf("Commands: <amount> to bid, result to query, exit to quit\n")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -32,6 +33,11 @@ func main() {
 			return
 		}
 
+		if scanner.Text() == "result" {
+			printResult(*clientID, servers)
+			continue
+		}
+
 		amount, err := strconv.Atoi(scanner.Text())
 		if err != nil || amount <= 0 {
 			fmt.Println("Invalid input. Please enter a positive integer.")
@@ -41,6 +47,29 @@ func main() {
 		bidAmount(*clientID, amount, servers)
 	}
 
+}
+
+func printResult(clientID int, servers []string) {
+	httpClient := &http.Client{}
+	for _, server := range servers {
+		resp, err := httpClient.Get(server + "/result")
+		if err != nil {
+			fmt.Printf("Client %d: Failed to create request %v\n", clientID, err)
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			fmt.Printf("Client %d: Failed to read response from %s: %v\n", clientID, server, err)
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			fmt.Printf("Client %d: Result from %s: %s", clientID, server, body)
+			return
+		}
+	}
+	fmt.Printf("Client %d: Failed to get result from all servers\n", clientID)
 }
 
 func bidAmount(clientID int, amount int, servers []string) {
