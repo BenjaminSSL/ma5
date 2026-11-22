@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -27,6 +29,11 @@ const (
 type Bid struct {
 	ClientID int `json:"client_id"`
 	Amount   int `json:"amount"`
+}
+
+type AuctionState struct {
+	Log     []Bid     `json:"log"`
+	EndTime time.Time `json:"end_time"`
 }
 
 type Server struct {
@@ -80,7 +87,6 @@ func main() {
 	}
 
 	go s.heartbeatLoop()
-	go s.syncLoop()
 
 	go func() {
 		log.Printf("Server %d listening on :%d", *id, 8000+*id)
@@ -107,7 +113,8 @@ func (s *Server) initServer() {
 	mux.HandleFunc("POST /heartbeat", s.heartbeat)
 	mux.HandleFunc("POST /election", s.election)
 	mux.HandleFunc("POST /coordinator", s.coordinator)
-	mux.HandleFunc("GET /sync", s.syncBids)
+	mux.HandleFunc("GET /replica", s.readReplica)
+	mux.HandleFunc("PUT /replica", s.storeReplica)
 	s.server = mux
 }
 
@@ -126,13 +133,14 @@ func (s *Server) heartbeatLoop() {
 		inElection := s.electionInProgress
 		started := s.electionStarted
 		leaderID := s.leaderID
+		endTime := s.auctionEndTime
 		s.mu.Unlock()
 
 		if isLeader {
 			for id, url := range s.otherNodes {
 				go func(id int, url string) {
 					endpoint := fmt.Sprintf(
-						"%s/heartbeat?id=%d", url, s.id,
+						"%s/heartbeat?id=%d&end=%d", url, s.id, endTime.UnixNano(),
 					)
 					resp, err := client().Post(endpoint, "", nil)
 					if err != nil {
@@ -169,7 +177,7 @@ func (s *Server) heartbeatLoop() {
 
 func (s *Server) startElection() {
 	s.mu.Lock()
-	if s.electionInProgress {
+	if s.leader || s.electionInProgress || time.Since(s.lastHeartbeat) <= heartbeatTimeout {
 		s.mu.Unlock()
 		return
 	}
@@ -214,27 +222,66 @@ func (s *Server) election(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) becomeLeader() {
 	s.mu.Lock()
+	oldLeader := s.leaderID
+	s.mu.Unlock()
+
+	for id, url := range s.otherNodes {
+		if id == oldLeader {
+			continue
+		}
+		// Stop old-leader updates on the peer before reading its log.
+		endpoint := fmt.Sprintf("%s/coordinator?id=%d", url, s.id)
+		resp, err := client().Post(endpoint, "", nil)
+		if err != nil {
+			log.Printf("Server %d: cannot announce leadership: %v", s.id, err)
+			return
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return
+		}
+
+		state, err := fetchReplica(url)
+		if err != nil {
+			log.Printf("Server %d: cannot recover auction: %v", s.id, err)
+			return
+		}
+
+		s.mu.Lock()
+		if !s.electionInProgress || s.leaderID != oldLeader {
+			s.mu.Unlock()
+			return
+		}
+		if len(state.Log) > len(s.log) {
+			s.installReplica(state)
+		}
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.electionInProgress || s.leaderID != oldLeader {
+		return
+	}
 	s.leader = true
 	s.leaderID = s.id
 	s.electionInProgress = false
 	s.lastHeartbeat = time.Now()
-	s.mu.Unlock()
-
 	log.Printf("Server %d: became leader", s.id)
+}
 
-	for _, url := range s.otherNodes {
-		go func(url string) {
-			endpoint := fmt.Sprintf(
-				"%s/coordinator?id=%d", url, s.id,
-			)
-			resp, err := client().Post(endpoint, "", nil)
-			if err != nil {
-				log.Printf("Coordinator notification failed: %v", err)
-				return
-			}
-			resp.Body.Close()
-		}(url)
+func fetchReplica(url string) (AuctionState, error) {
+	var state AuctionState
+	resp, err := client().Get(url + "/replica")
+	if err != nil {
+		return state, err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return state, fmt.Errorf("replica returned %s", resp.Status)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&state)
+	return state, err
 }
 
 func (s *Server) coordinator(w http.ResponseWriter, r *http.Request) {
@@ -274,6 +321,9 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.lastHeartbeat = time.Now()
+	if end, err := strconv.ParseInt(r.URL.Query().Get("end"), 10, 64); err == nil {
+		s.auctionEndTime = time.Unix(0, end)
+	}
 	s.mu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
@@ -319,54 +369,9 @@ func (s *Server) bid(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	isLeader := s.leader
 	leaderID := s.leaderID
-	auctionEndTime := s.auctionEndTime
 	s.mu.Unlock()
-
-	if time.Now().After(auctionEndTime) || time.Now().Equal(auctionEndTime) {
-		http.Redirect(w, r, fmt.Sprintf("http://localhost:%d/result", 8000+leaderID), http.StatusSeeOther)
-		return
-	}
-
-	// Only the leader accepts external bids.
 	if !isLeader {
-		leaderURL := fmt.Sprintf(
-			"http://localhost:%d",
-			8000+leaderID,
-		)
-
-		proxyClient := &http.Client{
-			Timeout: 5 * time.Second,
-		}
-
-		req, err := http.NewRequestWithContext(
-			r.Context(),
-			r.Method,
-			leaderURL+r.URL.RequestURI(),
-			r.Body,
-		)
-		if err != nil {
-			http.Error(w, "Failed to forward bid", http.StatusInternalServerError)
-			return
-		}
-
-		req.Header = r.Header.Clone()
-
-		resp, err := proxyClient.Do(req)
-		if err != nil {
-			http.Error(w, "Leader unavailable", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		// Forward the leader's response to the client.
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
-
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		forwardToLeader(w, r, leaderID)
 		return
 	}
 
@@ -376,101 +381,183 @@ func (s *Server) bid(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	if !s.leader {
 		s.mu.Unlock()
-		http.Error(w, "Leadership changed", http.StatusConflict)
+		http.Error(w, "Leadership changed", http.StatusServiceUnavailable)
 		return
 	}
-
+	if !time.Now().Before(s.auctionEndTime) {
+		s.mu.Unlock()
+		http.Error(w, "Auction has ended", http.StatusConflict)
+		return
+	}
 	if amount <= maxBid(s.bids) {
 		s.mu.Unlock()
-		http.Error(w, "Bid must exceed current highest bid",
-			http.StatusBadRequest)
+		http.Error(w, "Bid must exceed current highest bid", http.StatusBadRequest)
 		return
 	}
 
 	b := Bid{ClientID: clientID, Amount: amount}
+	state := AuctionState{
+		Log:     append(slices.Clone(s.log), b),
+		EndTime: s.auctionEndTime,
+	}
+	s.mu.Unlock()
+
+	if !s.replicate(state) {
+		http.Error(w, "Could not confirm bid replication", http.StatusServiceUnavailable)
+		return
+	}
+
+	s.mu.Lock()
+	if !s.leader {
+		s.mu.Unlock()
+		http.Error(w, "Leadership changed", http.StatusServiceUnavailable)
+		return
+	}
 	s.bids[clientID] = amount
-	s.log = append(s.log, b)
+	s.log = state.Log
 	s.mu.Unlock()
 
 	log.Printf("Server %d: accepted bid %+v", s.id, b)
-
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(b)
 }
 
-func (s *Server) syncBids(w http.ResponseWriter, r *http.Request) {
+func forwardToLeader(w http.ResponseWriter, r *http.Request, leaderID int) {
+	if r.Header.Get("X-Auction-Forwarded") != "" {
+		http.Error(w, "Leader unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	url := fmt.Sprintf("http://localhost:%d%s", 8000+leaderID, r.URL.RequestURI())
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, url, r.Body)
+	if err != nil {
+		http.Error(w, "Failed to forward request", http.StatusInternalServerError)
+		return
+	}
+	req.Header = r.Header.Clone()
+	req.Header.Set("X-Auction-Forwarded", "1")
+
+	proxyClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		http.Error(w, "Leader unavailable", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func (s *Server) replicate(state AuctionState) bool {
+	body, err := json.Marshal(state)
+	if err != nil {
+		return false
+	}
+
+	acknowledged := make(chan bool, len(s.otherNodes))
+	for _, url := range s.otherNodes {
+		go func(url string) {
+			endpoint := fmt.Sprintf("%s/replica?id=%d", url, s.id)
+			req, err := http.NewRequest(http.MethodPut, endpoint, bytes.NewReader(body))
+			if err != nil {
+				acknowledged <- false
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client().Do(req)
+			if err != nil {
+				acknowledged <- false
+				return
+			}
+			resp.Body.Close()
+			acknowledged <- resp.StatusCode == http.StatusOK
+		}(url)
+	}
+
+	// Attempt both followers in parallel. One acknowledgment plus the
+	// leader is a majority, and promotion reads both surviving logs.
+	replicated := false
+	for range s.otherNodes {
+		if <-acknowledged {
+			replicated = true
+		}
+	}
+	return replicated
+}
+
+func (s *Server) readReplica(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	data := append([]Bid(nil), s.log...)
+	state := AuctionState{Log: s.log, EndTime: s.auctionEndTime}
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(state)
 }
 
-func (s *Server) syncLoop() {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+func (s *Server) storeReplica(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.Atoi(r.URL.Query().Get("id"))
+	var state AuctionState
+	if err != nil || json.NewDecoder(r.Body).Decode(&state) != nil {
+		http.Error(w, "Invalid replica update", http.StatusBadRequest)
+		return
+	}
 
-	for range ticker.C {
-		s.mu.Lock()
-		isLeader := s.leader
-		leaderID := s.leaderID
-		s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.leader || s.electionInProgress || id != s.leaderID {
+		http.Error(w, "Unexpected leader", http.StatusConflict)
+		return
+	}
 
-		if isLeader || leaderID == s.id {
-			continue
-		}
+	prefix := min(len(s.log), len(state.Log))
+	if !slices.Equal(s.log[:prefix], state.Log[:prefix]) {
+		http.Error(w, "Conflicting replica history", http.StatusConflict)
+		return
+	}
+	if len(state.Log) >= len(s.log) {
+		s.installReplica(state)
+	}
+	w.WriteHeader(http.StatusOK)
+}
 
-		url := fmt.Sprintf(
-			"http://localhost:%d/sync", 8000+leaderID,
-		)
-		resp, err := client().Get(url)
-		if err != nil {
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			continue
-		}
-
-		var history []Bid
-		err = json.NewDecoder(resp.Body).Decode(&history)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		s.mu.Lock()
-		if !s.leader && s.leaderID == leaderID {
-			s.log = history
-			s.bids = make(map[int]int)
-			for _, b := range history {
-				s.bids[b.ClientID] = b.Amount
-			}
-		}
-		s.mu.Unlock()
+// installReplica requires s.mu.
+func (s *Server) installReplica(state AuctionState) {
+	s.log = state.Log
+	s.auctionEndTime = state.EndTime
+	s.bids = make(map[int]int)
+	for _, b := range state.Log {
+		s.bids[b.ClientID] = b.Amount
 	}
 }
 
 func (s *Server) result(w http.ResponseWriter, r *http.Request) {
+	s.bidMu.Lock()
 	s.mu.Lock()
+	if !s.leader {
+		leaderID := s.leaderID
+		s.mu.Unlock()
+		s.bidMu.Unlock()
+		forwardToLeader(w, r, leaderID)
+		return
+	}
 	highest := maxBid(s.bids)
-	var winner int
-	for id, amount := range s.bids {
-		if amount == highest {
-			winner = id
-			break
+	result := map[string]int{"highest_bid": highest}
+	if !time.Now().Before(s.auctionEndTime) {
+		result["bid_count"] = len(s.log)
+		for id, amount := range s.bids {
+			if amount == highest {
+				result["winner"] = id
+				break
+			}
 		}
 	}
-	count := len(s.log)
 	s.mu.Unlock()
+	s.bidMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]int{
-		"winner":      winner,
-		"highest_bid": highest,
-		"bid_count":   count,
-	})
+	_ = json.NewEncoder(w).Encode(result)
 }

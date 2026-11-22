@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
@@ -62,14 +61,6 @@ func bidAmount(clientID int, amount int, servers []string) {
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode == http.StatusOK && resp.Request.URL.Path == "/result" {
-			var result map[string]any
-			json.NewDecoder(resp.Body).Decode(&result)
-			for key, value := range result {
-				fmt.Printf("%-15s : %v\n", key, value)
-			}
-			return
-		}
 		if resp.StatusCode == http.StatusOK {
 			fmt.Printf("Client %d: Successfully placed bid of %d to %s\n", clientID, amount, server)
 			return
