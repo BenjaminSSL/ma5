@@ -16,6 +16,7 @@ func main() {
 
 	clientID := flag.Int("id", 0, "Client ID")
 	flag.Parse()
+	fmt.Printf("To exit the client write exit\n")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -24,6 +25,11 @@ func main() {
 			if err := scanner.Err(); err != nil {
 				fmt.Printf("Failed to read input: %v\n", err)
 			}
+			return
+		}
+
+		if scanner.Text() == "exit" {
+			fmt.Printf("Client %d: Exiting...\n", *clientID)
 			return
 		}
 
