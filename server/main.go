@@ -221,53 +221,65 @@ func (s *Server) election(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) becomeLeader() {
-	s.mu.Lock()
-	oldLeader := s.leaderID
-	s.mu.Unlock()
+    s.mu.Lock()
+    oldLeader := s.leaderID
+    s.mu.Unlock()
 
-	for id, url := range s.otherNodes {
-		if id == oldLeader {
-			continue
-		}
-		// Stop old-leader updates on the peer before reading its log.
-		endpoint := fmt.Sprintf("%s/coordinator?id=%d", url, s.id)
-		resp, err := client().Post(endpoint, "", nil)
-		if err != nil {
-			log.Printf("Server %d: cannot announce leadership: %v", s.id, err)
-			return
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return
-		}
+    acknowledgements := 1 // Count ourselves
+    latestState := AuctionState{}
 
-		state, err := fetchReplica(url)
-		if err != nil {
-			log.Printf("Server %d: cannot recover auction: %v", s.id, err)
-			return
-		}
+    s.mu.Lock()
+    latestState.Log = slices.Clone(s.log)
+    latestState.EndTime = s.auctionEndTime
+    s.mu.Unlock()
 
-		s.mu.Lock()
-		if !s.electionInProgress || s.leaderID != oldLeader {
-			s.mu.Unlock()
-			return
-		}
-		if len(state.Log) > len(s.log) {
-			s.installReplica(state)
-		}
-		s.mu.Unlock()
-	}
+    for id, url := range s.otherNodes {
+        if id == oldLeader {
+            continue
+        }
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.electionInProgress || s.leaderID != oldLeader {
-		return
-	}
-	s.leader = true
-	s.leaderID = s.id
-	s.electionInProgress = false
-	s.lastHeartbeat = time.Now()
-	log.Printf("Server %d: became leader", s.id)
+        state, err := fetchReplica(url)
+        if err != nil {
+            log.Printf("Server %d: cannot recover from node %d: %v",
+                s.id, id, err)
+            continue
+        }
+
+        acknowledgements++
+
+        if len(state.Log) > len(latestState.Log) {
+            latestState = state
+        }
+    }
+
+    if acknowledgements < 2 {
+        log.Printf("Server %d: insufficient nodes for election", s.id)
+        return
+    }
+
+    s.mu.Lock()
+    if !s.electionInProgress || s.leaderID != oldLeader {
+        s.mu.Unlock()
+        return
+    }
+
+    s.installReplica(latestState)
+    s.leader = true
+    s.leaderID = s.id
+    s.electionInProgress = false
+    s.lastHeartbeat = time.Now()
+    s.mu.Unlock()
+
+    log.Printf("Server %d: became leader", s.id)
+
+    for _, url := range s.otherNodes {
+        endpoint := fmt.Sprintf("%s/coordinator?id=%d", url, s.id)
+        resp, err := client().Post(endpoint, "", nil)
+        if err != nil {
+            continue
+        }
+        resp.Body.Close()
+    }
 }
 
 func fetchReplica(url string) (AuctionState, error) {
